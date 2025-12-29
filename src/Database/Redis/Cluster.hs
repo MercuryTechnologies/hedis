@@ -32,6 +32,7 @@ import qualified Database.Redis.ConnectionContext as CC
 import qualified Data.HashMap.Strict as HM
 import qualified Data.IntMap.Strict as IntMap
 import           Data.Typeable
+import qualified Network.TLS as TLS
 import qualified Scanner
 import System.IO.Unsafe(unsafeInterleaveIO)
 
@@ -102,8 +103,8 @@ instance Exception UnsupportedClusterCommandException
 newtype CrossSlotException = CrossSlotException [[B.ByteString]] deriving (Show, Typeable)
 instance Exception CrossSlotException
 
-connect :: [CMD.CommandInfo] -> MVar ShardMap -> Maybe Int -> Hooks -> IO Connection
-connect commandInfos shardMapVar timeoutOpt hooks' = do
+connect :: [CMD.CommandInfo] -> MVar ShardMap -> Maybe Int -> Maybe TLS.ClientParams -> Hooks -> IO Connection
+connect commandInfos shardMapVar timeoutOpt tlsParamsOpt hooks' = do
         shardMap <- readMVar shardMapVar
         stateVar <- newMVar $ Pending []
         pipelineVar <- newMVar $ Pipeline stateVar
@@ -114,8 +115,11 @@ connect commandInfos shardMapVar timeoutOpt hooks' = do
     connectNode :: Node -> IO (NodeID, NodeConnection)
     connectNode (Node n _ host port) = do
         ctx <- CC.connect host (CC.PortNumber $ toEnum port) timeoutOpt
+        ctx' <- case tlsParamsOpt of
+                  Nothing -> return ctx
+                  Just tlsParams -> CC.enableTLS tlsParams ctx
         ref <- IOR.newIORef Nothing
-        return (n, NodeConnection ctx ref n)
+        return (n, NodeConnection ctx' ref n)
 
 disconnect :: Connection -> IO ()
 disconnect (Connection nodeConnMap _ _ _ _) = mapM_ disconnectNode (HM.elems nodeConnMap) where
