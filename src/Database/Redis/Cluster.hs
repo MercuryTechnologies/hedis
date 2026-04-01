@@ -35,9 +35,10 @@ import           Data.Typeable
 import qualified Scanner
 import System.IO.Unsafe(unsafeInterleaveIO)
 
-import Database.Redis.Protocol(Reply(Error), renderRequest, reply)
+import Database.Redis.Protocol(Reply(..), renderRequest, reply)
 import qualified Database.Redis.Cluster.Command as CMD
 import Database.Redis.Hooks (Hooks)
+import Network.TLS (ClientParams (..))
 
 -- This module implements a clustered connection whilst maintaining
 -- compatibility with the original Hedis codebase. In particular it still
@@ -102,8 +103,11 @@ instance Exception UnsupportedClusterCommandException
 newtype CrossSlotException = CrossSlotException [[B.ByteString]] deriving (Show, Typeable)
 instance Exception CrossSlotException
 
-connect :: [CMD.CommandInfo] -> MVar ShardMap -> Maybe Int -> Hooks -> IO Connection
-connect commandInfos shardMapVar timeoutOpt hooks' = do
+data ClusterAuthError = ClusterAuthError Host Port Reply deriving (Show)
+instance Exception ClusterAuthError
+
+connect :: Maybe B.ByteString -> Maybe B.ByteString -> Maybe ClientParams -> [CMD.CommandInfo] -> MVar ShardMap -> Maybe Int -> IO Connection
+connect mUsername mPassword clientParams commandInfos shardMapVar timeoutOpt = do
         shardMap <- readMVar shardMapVar
         stateVar <- newMVar $ Pending []
         pipelineVar <- newMVar $ Pipeline stateVar
@@ -113,9 +117,29 @@ connect commandInfos shardMapVar timeoutOpt hooks' = do
     nodeConnections shardMap = HM.fromList <$> mapM connectNode (nub $ nodes shardMap)
     connectNode :: Node -> IO (NodeID, NodeConnection)
     connectNode (Node n _ host port) = do
-        ctx <- CC.connect host (CC.PortNumber $ toEnum port) timeoutOpt
+        ctx0 <- CC.connect host (CC.PortNumber $ toEnum port) timeoutOpt
+        ctx <- case mTlsParams of
+                  Nothing -> pure ctx0
+                  Just defaultTlsParams -> do
+                      -- The defaultTlsParams are used to connect to the first
+                      -- host in the cluster, other hosts have different
+                      -- hostnames and so require a different server
+                      -- identification params
+                      let tlsParams = defaultTlsParams {
+                                        clientServerIdentification =  (host, Char8.pack $ show port)
+                                      }
+                      CC.enableTLS tlsParams ctx0
         ref <- IOR.newIORef Nothing
-        return (n, NodeConnection ctx ref n)
+        let nodeConn = NodeConnection ctx ref n
+        case mPassword of
+           Nothing -> pure ()
+           Just password -> do
+              let reqOpts = maybe [password] (:[password]) mUsername
+              authReply <- requestNode1 nodeConn ( ["AUTH"] <> reqOpts )
+              case authReply of
+                SingleLine "OK" -> pure ()
+                _ -> throwIO $ ClusterAuthError host port authReply
+        return (n, nodeConn)
 
 disconnect :: Connection -> IO ()
 disconnect (Connection nodeConnMap _ _ _ _) = mapM_ disconnectNode (HM.elems nodeConnMap) where
@@ -372,28 +396,35 @@ allMasterNodes (Connection nodeConns _ _ _ _) (ShardMap shardMap) =
     masterNodes = (\(Shard master _) -> master) <$> nub (IntMap.elems shardMap)
 
 requestNode :: NodeConnection -> [[B.ByteString]] -> IO [Reply]
-requestNode (NodeConnection ctx lastRecvRef _) requests = do
+requestNode nodeConn@(NodeConnection ctx _ _) requests = do
     mapM_ (sendNode . renderRequest) requests
     _ <- CC.flush ctx
-    replicateM (length requests) recvNode
+    replicateM (length requests) $ recvNode nodeConn
 
     where
 
     sendNode :: B.ByteString -> IO ()
     sendNode = CC.send ctx
-    recvNode :: IO Reply
-    recvNode = do
-        maybeLastRecv <- IOR.readIORef lastRecvRef
-        scanResult <- case maybeLastRecv of
-            Just lastRecv -> Scanner.scanWith (CC.recv ctx) reply lastRecv
-            Nothing -> Scanner.scanWith (CC.recv ctx) reply B.empty
 
-        case scanResult of
-          Scanner.Fail{}       -> CC.errConnClosed
-          Scanner.More{}    -> error "Hedis: parseWith returned Partial"
-          Scanner.Done rest' r -> do
-            IOR.writeIORef lastRecvRef (Just rest')
-            return r
+requestNode1 :: NodeConnection -> [B.ByteString] -> IO Reply
+requestNode1 nodeConn@(NodeConnection ctx _ _) request = do
+    CC.send ctx $ renderRequest request
+    _ <- CC.flush ctx
+    recvNode nodeConn
+
+recvNode :: NodeConnection -> IO Reply
+recvNode (NodeConnection ctx lastRecvRef _) = do
+    maybeLastRecv <- IOR.readIORef lastRecvRef
+    scanResult <- case maybeLastRecv of
+        Just lastRecv -> Scanner.scanWith (CC.recv ctx) reply lastRecv
+        Nothing -> Scanner.scanWith (CC.recv ctx) reply B.empty
+
+    case scanResult of
+      Scanner.Fail{}       -> CC.errConnClosed
+      Scanner.More{}    -> error "Hedis: parseWith returned Partial"
+      Scanner.Done rest' r -> do
+        IOR.writeIORef lastRecvRef (Just rest')
+        return r
 
 nodes :: ShardMap -> [Node]
 nodes (ShardMap shardMap) = concatMap snd $ IntMap.toList $ fmap shardNodes shardMap where
